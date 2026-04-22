@@ -110,11 +110,12 @@ def evaluate_wanda_sweep(
     wanda_seqlen=512,
 ):
     out = {}
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     for sp in sparsities:
         m = model_cls.from_pretrained(
             model_name,
             torch_dtype=torch_dtype,
-            device_map=device_map,
+            device_map=device,
         )
         m.eval()
         apply_wanda_pruning(
