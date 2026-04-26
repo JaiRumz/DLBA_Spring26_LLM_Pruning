@@ -132,10 +132,11 @@ def evaluate_composite_sweep(
     nsamples=32,
     seqlen=512,
 ):
+    import gc
     device = "cuda" if torch.cuda.is_available() else "cpu"
     results = {}
 
-    # Precompute normalized sensitivity scores once
+    # Precompute normalized sensitivity scores
     per_layer = sensitivity_results["per_layer"]
     raw_drops = torch.tensor(
         [max(item["drop"], 0.0) for item in per_layer],
@@ -148,7 +149,7 @@ def evaluate_composite_sweep(
         print(f"Sparsity = {sp}")
         print(f"{'='*50}")
 
-        # Load once per sparsity
+        # Load model ONCE to compute Wanda scores
         m = model_cls.from_pretrained(
             model_name,
             torch_dtype=torch_dtype,
@@ -156,14 +157,24 @@ def evaluate_composite_sweep(
         )
         m.eval()
 
-        # Compute wanda scores once for this model copy
         wanda_scores_raw = compute_wanda_scores_only(
             m, tokenizer, nsamples=nsamples, seqlen=seqlen
         )
 
+        # Move ALL wanda scores to CPU
+        for k in wanda_scores_raw:
+            wanda_scores_raw[k] = wanda_scores_raw[k].cpu()
+
+        # Delete model BEFORE alpha loop
+        del m
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Loop over alphas
         for alpha in alphas:
             print(f"\n-- Alpha = {alpha} --")
 
+            # Load fresh model
             m_alpha = model_cls.from_pretrained(
                 model_name,
                 torch_dtype=torch_dtype,
@@ -171,18 +182,18 @@ def evaluate_composite_sweep(
             )
             m_alpha.eval()
 
-            # Build composite scores using precomputed wanda scores
             linears = _prunable_linears(m_alpha)
             composite_scores = {}
 
             for name, mod in linears:
                 layer_idx = _get_layer_index(name)
-                w = mod.weight.data
 
-                # Normalize wanda scores
-                wanda_norm = _normalize(wanda_scores_raw[name])
+                # Move wanda score to GPU ONLY when needed
+                wanda_norm = _normalize(
+                    wanda_scores_raw[name].to(mod.weight.device)
+                )
 
-                # Get sensitivity for this layer
+                # Sensitivity scalar
                 if (layer_idx is not None and
                         layer_idx < len(sensitivity_normalized)):
                     layer_sensitivity = sensitivity_normalized[layer_idx].item()
@@ -198,28 +209,29 @@ def evaluate_composite_sweep(
                     (1 - alpha) * sensitivity_matrix
                 )
 
-            # Prune and evaluate
+            # Prune
             apply_composite_pruning(m_alpha, composite_scores, sparsity=sp)
 
             if sp not in results:
                 results[sp] = {}
 
-            results[sp][alpha] = {
-                "gsm8k": eval_gsm8k(
-                    m_alpha, tokenizer, num_samples=gsm8k_samples
-                ),
-                "arc_challenge": eval_arc(
-                    m_alpha, tokenizer, num_samples=arc_samples
-                ),
-                "perplexity": eval_ppl(
-                    m_alpha, tokenizer, num_samples=ppl_samples
-                ),
-            }
+            # Evaluate
+            with torch.no_grad():
+                results[sp][alpha] = {
+                    "gsm8k": eval_gsm8k(
+                        m_alpha, tokenizer, num_samples=gsm8k_samples
+                    ),
+                    "arc_challenge": eval_arc(
+                        m_alpha, tokenizer, num_samples=arc_samples
+                    ),
+                    "perplexity": eval_ppl(
+                        m_alpha, tokenizer, num_samples=ppl_samples
+                    ),
+                }
 
-            del m_alpha
+            # FULL CLEANUP
+            del m_alpha, composite_scores, wanda_norm, sensitivity_matrix
             torch.cuda.empty_cache()
-
-        del m
-        torch.cuda.empty_cache()
+            gc.collect()
 
     return results
